@@ -15,18 +15,13 @@
 //      "log"
 //  )
 //
-//  func Index(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//  func Index(w http.ResponseWriter, r *http.Request) {
 //      fmt.Fprint(w, "Welcome!\n")
-//  }
-//
-//  func Hello(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-//      fmt.Fprintf(w, "hello, %s!\n", ps.ByName("name"))
 //  }
 //
 //  func main() {
 //      router := httprouter.New()
 //      router.GET("/", Index)
-//      router.GET("/hello/:name", Hello)
 //
 //      log.Fatal(http.ListenAndServe(":8080", router))
 //  }
@@ -63,17 +58,6 @@
 //   /files/LICENSE                      match: filepath="/LICENSE"
 //   /files/templates/article.html       match: filepath="/templates/article.html"
 //   /files                              no match, but the router would redirect
-//
-// The value of parameters is saved as a slice of the Param struct, consisting
-// each of a key and a value. The slice is passed to the Handle func as a third
-// parameter.
-// There are two ways to retrieve the value of a parameter:
-//  // by the name of the parameter
-//  user := ps.ByName("user") // defined by :user or *user
-//
-//  // by the index of the parameter. This way you can also get the name (key)
-//  thirdKey   := ps[2].Key   // the name of the 3rd parameter
-//  thirdValue := ps[2].Value // the value of the 3rd parameter
 package httprouter
 
 import (
@@ -86,34 +70,7 @@ import (
 // Handle is a function that can be registered to a route to handle HTTP
 // requests. Like http.HandlerFunc, but has a third parameter for the values of
 // wildcards (path variables).
-type Handle func(http.ResponseWriter, *http.Request, Params)
-
-// Param is a single URL parameter, consisting of a key and a value.
-type Param struct {
-	Key   string
-	Value string
-}
-
-// Params is a Param-slice, as returned by the router.
-// The slice is ordered, the first URL parameter is also the first slice value.
-// It is therefore safe to read values by the index.
-type Params []Param
-
-// ByName returns the value of the first Param which key matches the given name.
-// If no matching Param is found, an empty string is returned.
-func (ps Params) ByName(name string) string {
-	for _, p := range ps {
-		if p.Key == name {
-			return p.Value
-		}
-	}
-	return ""
-}
-
-type paramsKey struct{}
-
-// ParamsKey is the request context key under which URL params are stored.
-var ParamsKey = paramsKey{}
+type Handle func(http.ResponseWriter, *http.Request)
 
 // ParamsFromContext pulls the URL parameters from a request context,
 // or returns nil if none are present.
@@ -137,9 +94,6 @@ func (ps Params) MatchedRoutePath() string {
 // handler functions via configurable routes
 type Router struct {
 	trees map[string]*node
-
-	paramsPool sync.Pool
-	maxParams  uint16
 
 	// If enabled, adds the matched route path onto the http.Request context
 	// before invoking the handler.
@@ -219,30 +173,11 @@ func New() *Router {
 	}
 }
 
-func (r *Router) getParams() *Params {
-	ps, _ := r.paramsPool.Get().(*Params)
-	*ps = (*ps)[0:0] // reset slice
-	return ps
-}
 
-func (r *Router) putParams(ps *Params) {
-	if ps != nil {
-		r.paramsPool.Put(ps)
-	}
-}
-
+// TODO(Bagus): This may be able to be removed later
 func (r *Router) saveMatchedRoutePath(path string, handle Handle) Handle {
-	return func(w http.ResponseWriter, req *http.Request, ps Params) {
-		if ps == nil {
-			psp := r.getParams()
-			ps = (*psp)[0:1]
-			ps[0] = Param{Key: MatchedRoutePathParam, Value: path}
-			handle(w, req, ps)
-			r.putParams(psp)
-		} else {
-			ps = append(ps, Param{Key: MatchedRoutePathParam, Value: path})
-			handle(w, req, ps)
-		}
+	return func(w http.ResponseWriter, req *http.Request) {
+		handle(w, req)
 	}
 }
 
@@ -320,19 +255,6 @@ func (r *Router) Handle(method, path string, handle Handle) {
 	}
 
 	root.addRoute(path, handle)
-
-	// Update maxParams
-	if paramsCount := countParams(path); paramsCount+varsCount > r.maxParams {
-		r.maxParams = paramsCount + varsCount
-	}
-
-	// Lazy-init paramsPool alloc func
-	if r.paramsPool.New == nil && r.maxParams > 0 {
-		r.paramsPool.New = func() interface{} {
-			ps := make(Params, 0, r.maxParams)
-			return &ps
-		}
-	}
 }
 
 // Handler is an adapter which allows the usage of an http.Handler as a
@@ -340,12 +262,7 @@ func (r *Router) Handle(method, path string, handle Handle) {
 // The Params are available in the request context under ParamsKey.
 func (r *Router) Handler(method, path string, handler http.Handler) {
 	r.Handle(method, path,
-		func(w http.ResponseWriter, req *http.Request, p Params) {
-			if len(p) > 0 {
-				ctx := req.Context()
-				ctx = context.WithValue(ctx, ParamsKey, p)
-				req = req.WithContext(ctx)
-			}
+		func(w http.ResponseWriter, req *http.Request) {
 			handler.ServeHTTP(w, req)
 		},
 	)
@@ -374,7 +291,7 @@ func (r *Router) ServeFiles(path string, root http.FileSystem) {
 
 	fileServer := http.FileServer(root)
 
-	r.GET(path, func(w http.ResponseWriter, req *http.Request, ps Params) {
+	r.GET(path, func(w http.ResponseWriter, req *http.Request) {
 		req.URL.Path = ps.ByName("filepath")
 		fileServer.ServeHTTP(w, req)
 	})
@@ -395,7 +312,6 @@ func (r *Router) Lookup(method, path string) (Handle, Params, bool) {
 	if root := r.trees[method]; root != nil {
 		handle, ps, tsr := root.getValue(path, r.getParams)
 		if handle == nil {
-			r.putParams(ps)
 			return nil, nil, tsr
 		}
 		if ps == nil {
@@ -469,7 +385,6 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if handle, ps, tsr := root.getValue(path, r.getParams); handle != nil {
 			if ps != nil {
 				handle(w, req, *ps)
-				r.putParams(ps)
 			} else {
 				handle(w, req, nil)
 			}
