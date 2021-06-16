@@ -72,24 +72,6 @@ import (
 // wildcards (path variables).
 type Handle func(http.ResponseWriter, *http.Request)
 
-// ParamsFromContext pulls the URL parameters from a request context,
-// or returns nil if none are present.
-func ParamsFromContext(ctx context.Context) Params {
-	p, _ := ctx.Value(ParamsKey).(Params)
-	return p
-}
-
-// MatchedRoutePathParam is the Param name under which the path of the matched
-// route is stored, if Router.SaveMatchedRoutePath is set.
-var MatchedRoutePathParam = "$matchedRoutePath"
-
-// MatchedRoutePath retrieves the path of the matched route.
-// Router.SaveMatchedRoutePath must have been enabled when the respective
-// handler was added, otherwise this function always returns an empty string.
-func (ps Params) MatchedRoutePath() string {
-	return ps.ByName(MatchedRoutePathParam)
-}
-
 // Router is a http.Handler which can be used to dispatch requests to different
 // handler functions via configurable routes
 type Router struct {
@@ -259,7 +241,6 @@ func (r *Router) Handle(method, path string, handle Handle) {
 
 // Handler is an adapter which allows the usage of an http.Handler as a
 // request handle.
-// The Params are available in the request context under ParamsKey.
 func (r *Router) Handler(method, path string, handler http.Handler) {
 	r.Handle(method, path,
 		func(w http.ResponseWriter, req *http.Request) {
@@ -308,18 +289,15 @@ func (r *Router) recv(w http.ResponseWriter, req *http.Request) {
 // If the path was found, it returns the handle function and the path parameter
 // values. Otherwise the third return value indicates whether a redirection to
 // the same path with an extra / without the trailing slash should be performed.
-func (r *Router) Lookup(method, path string) (Handle, Params, bool) {
+func (r *Router) Lookup(method, path string) (Handle, bool) {
 	if root := r.trees[method]; root != nil {
-		handle, ps, tsr := root.getValue(path, r.getParams)
+		handle, tsr := root.getValue(path)
 		if handle == nil {
-			return nil, nil, tsr
+			return nil, tsr
 		}
-		if ps == nil {
-			return handle, nil, tsr
-		}
-		return handle, *ps, tsr
+		return handle, tsr
 	}
-	return nil, nil, false
+	return nil, false
 }
 
 func (r *Router) allowed(path, reqMethod string) (allow string) {
@@ -382,12 +360,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.Path
 
 	if root := r.trees[req.Method]; root != nil {
-		if handle, ps, tsr := root.getValue(path, r.getParams); handle != nil {
-			if ps != nil {
-				handle(w, req, *ps)
-			} else {
-				handle(w, req, nil)
-			}
+		if handle, tsr := root.getValue(path); handle != nil {
+			handle(w, req)
 			return
 		} else if req.Method != http.MethodConnect && path != "/" {
 			// Moved Permanently, request with GET method
